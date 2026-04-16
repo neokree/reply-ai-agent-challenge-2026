@@ -167,11 +167,14 @@ Un `transaction_id` per riga, nessun header.
     "avg_amount_by_type": {"transfer": 1200.0, "e-commerce": 85.0},
     "std_amount_by_type": {"transfer": 400.0, "e-commerce": 30.0},
     "typical_hours": [9, 10, 11, 12, 14, 15, 16, 17, 18],
+    "weekend_active": False,           # True se >20% delle tx sono nel weekend
     "payment_methods": {"debit card": 45, "mobile device": 12},
     "known_recipients": {"IBAN1", "IBAN2", "MERCHANT-ID"},
+    "last_tx_to": {"IBAN1": datetime, "IBAN2": datetime},  # ultimo tx per recipient
     "avg_daily_tx_count": 2.3,
     "residence_coords": (47.4836, 6.8403),
-    "salary": 34100
+    "salary": 34100,
+    "often_round_amounts": False,      # True se >30% delle tx sono importi tondi
   }
 }
 ```
@@ -325,16 +328,67 @@ else:
     score = 0.0
 
 # Check pattern drain: multiple tx che erodono verso 0
-recent_txs = get_user_txs_last_hours(tx.sender_id, hours=2)
+recent_txs = get_user_txs_last_hours(tx.sender_id, tx.timestamp, hours=2)
 if len(recent_txs) >= 3:
     total_recent_spent = sum(t.amount for t in recent_txs)
     if total_recent_spent / balance_before > 0.8:
         score = 1.0  # Pattern drain attivo
 ```
 
+**Helper function:**
+```python
+def get_user_txs_last_hours(sender_id: str, current_ts: datetime, hours: int) -> list:
+    """
+    Ritorna le transazioni dello stesso utente nelle ultime N ore.
+    Deve essere chiamato con accesso al DataFrame delle transazioni eval.
+    """
+    cutoff = current_ts - timedelta(hours=hours)
+    return [tx for tx in eval_transactions 
+            if tx.sender_id == sender_id 
+            and cutoff <= tx.timestamp < current_ts]
+```
+
 **Output:** `float` 0.0-1.0
 
 ---
+
+### 5.10 Error Handling
+
+**Empty training data per user:**
+- Se un utente non ha tx nel training, usa fallback globali:
+  - `avg_amount_by_type`: media globale di tutte le tx training
+  - `std_amount_by_type`: deviazione standard globale
+  - `typical_hours`: [8-20] (orario lavorativo default)
+  - `weekend_active`: False
+  - `often_round_amounts`: False
+
+**Missing location data:**
+- Se `tx.location` è vuoto (non in-person): `geo_score = 0.0`
+- Se `locations.json` non ha dati per l'utente: `geo_score = 0.0`
+- Se geocoding fallisce (API error, location ambigua): log warning, `geo_score = 0.0`
+
+**Geocoding specifics:**
+```python
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+
+geolocator = Nominatim(user_agent="fraud_detector")
+
+def geocode_location(location_str: str) -> tuple[float, float] | None:
+    """
+    Geocode location string to (lat, lng).
+    Returns None on failure.
+    """
+    try:
+        # Extract city from strings like "Munich - Isar River Cafe"
+        city = location_str.split(" - ")[0].strip()
+        result = geolocator.geocode(city, timeout=5)
+        if result:
+            return (result.latitude, result.longitude)
+    except (GeocoderTimedOut, GeocoderServiceError) as e:
+        logging.warning(f"Geocoding failed for {location_str}: {e}")
+    return None
+```
 
 ---
 
@@ -431,10 +485,37 @@ def detect_circular_flows(G):
     return [c for c in cycles if len(c) >= 3]
 
 def detect_rapid_layering(G, max_hours=2):
-    """Catene di tx rapide attraverso intermediari"""
-    # Implementazione basata su timestamp degli archi
-    pass
+    """
+    Catene di tx rapide attraverso intermediari.
+    Pattern: A→B→C dove B riceve e trasferisce entro max_hours.
+    """
+    suspicious_txs = []
+    
+    for node in G.nodes():
+        # Trova tx in entrata e uscita per questo nodo
+        in_edges = list(G.in_edges(node, data=True))
+        out_edges = list(G.out_edges(node, data=True))
+        
+        for in_edge in in_edges:
+            in_ts = in_edge[2]['timestamp']
+            in_amount = in_edge[2]['amount']
+            
+            for out_edge in out_edges:
+                out_ts = out_edge[2]['timestamp']
+                out_amount = out_edge[2]['amount']
+                
+                # Check: uscita entro max_hours dall'entrata
+                time_diff = (out_ts - in_ts).total_seconds() / 3600
+                if 0 < time_diff <= max_hours:
+                    # Check: importo simile (±20%)
+                    if 0.8 <= out_amount / in_amount <= 1.2:
+                        suspicious_txs.append(in_edge[2]['tx_id'])
+                        suspicious_txs.append(out_edge[2]['tx_id'])
+    
+    return list(set(suspicious_txs))
 ```
+
+**Data source:** Il grafo viene costruito da **training + eval transactions** combinati per rilevare pattern cross-dataset.
 
 **Output:** 
 - Lista di `account_id` sospetti (muli, intermediari)
@@ -516,6 +597,37 @@ def aggregate_scores(tx, profiles, locations, ml_scores, graph_scores):
 - SMS training + eval
 - Mail training + eval  
 - Audio transcriptions (se presenti)
+- User name → IBAN mapping
+
+**Context limit handling:**
+Per dataset grandi, se il contenuto supera 100K tokens:
+1. Raggruppa comunicazioni per utente
+2. Processa in batch (max 50K tokens per call)
+3. Aggrega i risultati
+
+```python
+MAX_TOKENS_PER_CALL = 50000  # ~200K chars
+
+def chunk_communications(sms, mails, audio):
+    """Split communications into chunks that fit context window."""
+    chunks = []
+    current_chunk = {"sms": [], "mails": [], "audio": []}
+    current_size = 0
+    
+    for item in sms + mails + audio:
+        item_size = len(str(item))
+        if current_size + item_size > MAX_TOKENS_PER_CALL * 4:
+            chunks.append(current_chunk)
+            current_chunk = {"sms": [], "mails": [], "audio": []}
+            current_size = 0
+        # Add to appropriate list
+        current_chunk[item['type']].append(item)
+        current_size += item_size
+    
+    if current_size > 0:
+        chunks.append(current_chunk)
+    return chunks
+```
 
 **Task:** Identificare segnali di social engineering:
 - Phishing
@@ -655,7 +767,30 @@ def parse_coordinator_response(response: str, valid_tx_ids: set) -> list[str]:
     return flagged
 ```
 
-**Fallback strategy:** Se il parsing fallisce o output invalido, usa i risk score algoritmici per flaggare il top N% delle tx (dove N è calibrato per rispettare i vincoli del challenge).
+**Fallback strategy:** Se il parsing fallisce o output invalido, usa i risk score algoritmici:
+- **Empty output fallback:** Flag top 15% delle tx per `total_risk` score
+- **All flagged fallback:** Flag solo top 30% delle tx per `total_risk` score
+- Queste soglie garantiscono output valido secondo i vincoli del challenge
+
+**LLM API retry logic:**
+```python
+import time
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type((RateLimitError, ServiceUnavailableError))
+)
+def call_llm_with_retry(model, messages, config):
+    return model.invoke(messages, config=config)
+```
+
+Gestione errori:
+- **429 Rate Limit:** Exponential backoff (2s, 4s, 8s)
+- **503 Service Unavailable:** Retry con backoff
+- **Timeout:** 60s per call, poi retry
+- **Max 3 attempts:** Se tutti falliscono, usa fallback algoritmico
 
 ---
 
@@ -714,6 +849,7 @@ geopy
 openai
 scikit-learn        # Isolation Forest
 networkx            # Graph analysis base
+tenacity            # Retry logic for LLM calls
 # torch-geometric   # Optional: GNN per produzione su larga scala
 ```
 
