@@ -38,7 +38,7 @@ load_data()
 │  LAYER 1 — PREPROCESSING (no LLM)                           │
 ├─────────────────────────────────────────────────────────────┤
 │  [Se audio presente - solo Deus Ex]                         │
-│  audio_transcriber()  → Whisper API → trascrizioni .txt     │
+│  audio_transcriber()  → Whisper API → dict[filename, text]  │
 └─────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -82,6 +82,8 @@ reply-ai-agent-challenge-2026/
 ├── main.py                    # Entry point + orchestrazione
 ├── preprocessing/
 │   └── audio.py               # audio_transcriber() con Whisper
+│                              # Output: dict[filename, transcript_text]
+│                              # Estrae user name da filename per join
 ├── scoring/
 │   ├── profiler.py            # build_user_profiles()
 │   ├── amount.py              # amount_scorer()
@@ -113,7 +115,7 @@ reply-ai-agent-challenge-2026/
 | `locations.json` | GPS tracking (biotag, timestamp, lat/lng) | geo_checker |
 | `sms.json` | Thread SMS | comms_agent |
 | `mails.json` | Thread email | comms_agent |
-| `audio/` | MP3 (solo Deus Ex) | audio_transcriber → comms_agent |
+| `audio/` | MP3 (solo Deus Ex), naming: `YYYYMMDD_HHMMSS-nome_cognome.mp3` | audio_transcriber → comms_agent |
 
 ### Output
 
@@ -177,11 +179,17 @@ score = min(abs(z_score) / 4, 1.0)
 
 ### 5.4 geo_checker()
 
+**Transaction location source:**
+- Il campo `location` in `transactions.csv` contiene stringhe come "Munich - Isar River Cafe"
+- Per le tx in-person: geocoding via geopy o lookup su tabella città note
+- Per trasferimenti/e-commerce: `location` è vuoto, skip geo check
+
 **Logic:**
-1. Trova posizione GPS dell'utente più vicina al timestamp tx
-2. Calcola distanza da location della tx (se in-person)
-3. Se distanza > 50km → flag
-4. Check velocità tra tx consecutive: se > 500 km/h → impossibile
+1. Trova posizione GPS dell'utente più vicina al timestamp tx (da `locations.json` usando `biotag`)
+2. Se tx è in-person e ha `location`: geocode → coordinate
+3. Calcola distanza GPS utente vs tx location
+4. Se distanza > 50km → flag
+5. Check velocità tra tx consecutive con location: se > 500 km/h → impossibile
 
 **Output:** `float` 0.0-1.0
 
@@ -199,7 +207,55 @@ score = min(abs(z_score) / 4, 1.0)
 - Conta tx dello stesso utente in finestre 1h e 24h
 - Se > 5 tx/ora o > 3x media giornaliera → flag
 
-**Output:** `dict[transaction_id, float]`
+**Output:** `float` 0.0-1.0 (per singola tx, come gli altri scorer)
+
+---
+
+### 5.7 Score Aggregation
+
+Tutti gli scorer vengono applicati a ogni transazione eval. I risultati vengono combinati in un DataFrame:
+
+```python
+def aggregate_scores(tx, profiles, locations):
+    scores = {
+        "transaction_id": tx.id,
+        "amount_score": amount_scorer(tx, profiles),
+        "time_score": time_scorer(tx, profiles),
+        "geo_score": geo_checker(tx, locations, profiles),
+        "new_entity_score": new_entity_detector(tx, profiles),
+        "frequency_score": frequency_checker(tx, profiles),
+    }
+    # Weighted average - pesi iniziali uniformi, tunable dopo test
+    weights = {
+        "amount_score": 0.25,
+        "time_score": 0.15,
+        "geo_score": 0.25,
+        "new_entity_score": 0.20,
+        "frequency_score": 0.15
+    }
+    scores["total_risk"] = sum(
+        scores[k] * weights[k] for k in weights
+    )
+    return scores
+```
+
+**Output DataFrame:**
+| tx_id | amount | time | geo | new_entity | freq | total_risk |
+|-------|--------|------|-----|------------|------|------------|
+
+---
+
+### 5.8 Error Handling
+
+**Empty training data per user:**
+- Se un utente non ha tx nel training, usa fallback globali:
+  - `avg_amount_by_type`: media globale di tutte le tx training
+  - `std_amount_by_type`: deviazione standard globale
+  - `typical_hours`: [8-20] (orario lavorativo default)
+
+**Missing location data:**
+- Se `tx.location` è vuoto (non in-person): `geo_score = 0.0`
+- Se `locations.json` non ha dati per l'utente: `geo_score = 0.0`
 
 ---
 
@@ -226,7 +282,8 @@ score = min(abs(z_score) / 4, 1.0)
 {
   "signals": [
     {
-      "user": "Alain Regnier",
+      "user_iban": "FR85H4824371990132980420818",
+      "user_name": "Alain Regnier",
       "source": "sms|email|audio",
       "severity": "high|medium|low",
       "reason": "descrizione del segnale"
@@ -234,6 +291,8 @@ score = min(abs(z_score) / 4, 1.0)
   ]
 }
 ```
+
+**Nota:** Il prompt include la mappatura nome→IBAN estratta da `users.json` per permettere il join con i profili.
 
 **Prompt template:**
 ```
@@ -304,6 +363,45 @@ TRANSAZIONI EVAL:
 Rispondi SOLO con la lista di transaction_id da flaggare, uno per riga.
 Nessun altro testo, nessuna spiegazione.
 ```
+
+### 6.3 LLM Output Parsing & Error Handling
+
+**comms_agent output parsing:**
+```python
+def parse_comms_response(response: str) -> dict:
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError:
+        # Fallback: cerca JSON dentro il testo
+        match = re.search(r'\{.*\}', response, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        # Ultimo fallback: nessun segnale
+        return {"signals": []}
+```
+
+**fraud_coordinator output parsing:**
+```python
+def parse_coordinator_response(response: str, valid_tx_ids: set) -> list[str]:
+    lines = response.strip().split('\n')
+    flagged = []
+    for line in lines:
+        tx_id = line.strip()
+        if tx_id in valid_tx_ids:
+            flagged.append(tx_id)
+    
+    # Validazione output
+    if len(flagged) == 0:
+        # Fallback: flag top 10% per risk score
+        raise ValueError("Coordinator returned empty list")
+    if len(flagged) == len(valid_tx_ids):
+        # Fallback: flag solo top 50% per risk score
+        raise ValueError("Coordinator flagged all transactions")
+    
+    return flagged
+```
+
+**Fallback strategy:** Se il parsing fallisce o output invalido, usa i risk score algoritmici per flaggare il top N% delle tx (dove N è calibrato per rispettare i vincoli del challenge).
 
 ---
 
@@ -401,8 +499,8 @@ Budget $40 → ~70+ run completi possibili.
 ## 11. Open Questions
 
 1. **Soglie scorer:** I valori (Z > 4, distanza > 50km, velocità > 500 km/h) sono ragionevoli ma potrebbero richiedere tuning dopo i primi test
-2. **Pesi weighted sum:** Come combinare gli score? Semplice media o pesi diversi per categoria?
-3. **Audio format:** Whisper supporta MP3 direttamente? Verificare prima dell'implementazione
+2. ~~**Pesi weighted sum:** Come combinare gli score?~~ → Risolto: weighted average con pesi in 5.7
+3. **Audio format:** Whisper supporta MP3 direttamente → Sì, confermato (documentazione OpenAI)
 
 ---
 
