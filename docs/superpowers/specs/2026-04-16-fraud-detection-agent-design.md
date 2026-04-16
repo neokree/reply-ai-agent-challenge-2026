@@ -47,12 +47,24 @@ load_data()
 ├─────────────────────────────────────────────────────────────┤
 │  build_user_profiles()  → stats da training                 │
 │  amount_scorer()        → Z-score importi                   │
-│  time_scorer()          → flag orari anomali                │
-│  geo_checker()          → velocità impossibili              │
-│  new_entity_detector()  → recipient/merchant nuovi          │
+│  time_scorer()          → flag orari anomali + weekend      │
+│  geo_checker()          → velocità impossibili (>500 km/h)  │
+│  new_entity_detector()  → recipient nuovi + days_since      │
 │  frequency_checker()    → troppe tx in finestra breve       │
+│  channel_switch_scorer()→ cambio metodo pagamento           │
+│  round_amount_scorer()  → importi tondi sospetti            │
+│  balance_drain_scorer() → % saldo spesa in una tx           │
 │                                                             │
 │  Output: DataFrame risk scores per transaction_id           │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  LAYER 2.5 — ML ANOMALY DETECTION (no LLM)                  │
+├─────────────────────────────────────────────────────────────┤
+│  isolation_forest()     → anomaly score su feature vector   │
+│  graph_analyzer()       → GNN per pattern reti di frode     │
+│                         → money laundering, smurfing, muli  │
 └─────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -90,7 +102,13 @@ reply-ai-agent-challenge-2026/
 │   ├── time.py                # time_scorer()
 │   ├── geo.py                 # geo_checker()
 │   ├── entities.py            # new_entity_detector()
-│   └── frequency.py           # frequency_checker()
+│   ├── frequency.py           # frequency_checker()
+│   ├── channel.py             # channel_switch_scorer()
+│   ├── round_amount.py        # round_amount_scorer()
+│   └── balance.py             # balance_drain_scorer()
+├── ml/
+│   ├── isolation_forest.py    # Anomaly detection
+│   └── graph_analyzer.py      # GNN / NetworkX patterns
 ├── agents/
 │   ├── comms.py               # comms_agent() — LLM
 │   └── coordinator.py         # fraud_coordinator() — LLM
@@ -171,9 +189,26 @@ score = min(abs(z_score) / 4, 1.0)
 ### 5.3 time_scorer()
 
 **Logic:**
-- Estrae ora della tx
-- Confronta con ore tipiche dell'utente da training
-- Score = distanza minima normalizzata
+```python
+tx_hour = tx.timestamp.hour
+tx_weekday = tx.timestamp.weekday()  # 0=Mon, 6=Sun
+is_weekend = tx_weekday >= 5
+
+typical_hours = user_profile["typical_hours"]
+typical_weekend_activity = user_profile.get("weekend_active", False)
+
+# Score per ora anomala
+if tx_hour in typical_hours:
+    hour_score = 0.0
+else:
+    min_distance = min(abs(tx_hour - h) for h in typical_hours)
+    hour_score = min(min_distance / 6, 1.0)
+
+# Boost se weekend e utente non opera di solito nel weekend
+weekend_boost = 0.3 if (is_weekend and not typical_weekend_activity) else 0.0
+
+score = min(hour_score + weekend_boost, 1.0)
+```
 
 **Output:** `float` 0.0-1.0
 
@@ -196,8 +231,24 @@ score = min(abs(z_score) / 4, 1.0)
 ### 5.5 new_entity_detector()
 
 **Logic:**
-- Verifica se recipient_id/recipient_iban è nel set known_recipients
-- Se nuovo: score base 0.5, aumenta con importo relativo a salary
+```python
+known = user_profile["known_recipients"]
+recipient = tx.recipient_id or tx.recipient_iban
+
+if recipient in known:
+    # Già visto: calcola days_since_last_tx
+    last_tx_date = user_profile["last_tx_to"].get(recipient)
+    if last_tx_date:
+        days_since = (tx.timestamp - last_tx_date).days
+        # Se non visto da 90+ giorni, lieve sospetto
+        score = 0.2 if days_since > 90 else 0.0
+    else:
+        score = 0.0
+else:
+    # Mai visto: score base 0.5, boost con importo relativo
+    amount_factor = min(tx.amount / user_profile["salary"], 1.0)
+    score = 0.5 + (0.5 * amount_factor)  # range 0.5-1.0
+```
 
 **Output:** `float` 0.0-1.0
 
@@ -209,29 +260,225 @@ score = min(abs(z_score) / 4, 1.0)
 
 **Output:** `float` 0.0-1.0 (per singola tx, come gli altri scorer)
 
+### 5.7 channel_switch_scorer()
+
+**Logic:**
+```python
+usual_methods = user_profile["payment_methods"]  # dict: method -> count
+total_txs = sum(usual_methods.values())
+method_pct = usual_methods.get(tx.payment_method, 0) / total_txs
+
+if method_pct == 0:
+    # Metodo MAI usato prima
+    score = 0.8
+elif method_pct < 0.1:
+    # Metodo usato raramente (<10% delle tx)
+    score = 0.4
+else:
+    score = 0.0
+
+# Boost se combinato con importo alto
+if tx.amount > user_profile["salary"] * 0.5:
+    score = min(score + 0.2, 1.0)
+```
+
+**Output:** `float` 0.0-1.0
+
+### 5.8 round_amount_scorer()
+
+**Logic:**
+```python
+# Fraudster spesso testano con cifre tonde
+is_round_100 = (tx.amount % 100 == 0)
+is_round_1000 = (tx.amount % 1000 == 0)
+
+if is_round_1000 and tx.amount >= 1000:
+    score = 0.5
+elif is_round_100 and tx.amount >= 100:
+    score = 0.3
+else:
+    score = 0.0
+
+# Non penalizzare se l'utente ha storico di importi tondi (es. affitto fisso)
+if user_profile.get("often_round_amounts", False):
+    score *= 0.3  # Riduci penalità
+```
+
+**Output:** `float` 0.0-1.0
+
+### 5.9 balance_drain_scorer()
+
+**Logic:**
+```python
+# Percentuale del saldo spesa in questa singola tx
+balance_before = tx.balance_after + tx.amount
+pct_spent = tx.amount / balance_before if balance_before > 0 else 0
+
+if pct_spent > 0.9:
+    # Quasi tutto il saldo in una tx
+    score = 1.0
+elif pct_spent > 0.7:
+    score = 0.7
+elif pct_spent > 0.5:
+    score = 0.4
+else:
+    score = 0.0
+
+# Check pattern drain: multiple tx che erodono verso 0
+recent_txs = get_user_txs_last_hours(tx.sender_id, hours=2)
+if len(recent_txs) >= 3:
+    total_recent_spent = sum(t.amount for t in recent_txs)
+    if total_recent_spent / balance_before > 0.8:
+        score = 1.0  # Pattern drain attivo
+```
+
+**Output:** `float` 0.0-1.0
+
 ---
 
-### 5.7 Score Aggregation
+---
 
-Tutti gli scorer vengono applicati a ogni transazione eval. I risultati vengono combinati in un DataFrame:
+## 5B. ML Anomaly Detection Layer
+
+### 5B.1 isolation_forest()
+
+**Purpose:** Rilevare anomalie in spazio multidimensionale che i singoli scorer potrebbero non catturare.
+
+**Input:** Feature vector per ogni transazione:
+```python
+features = [
+    amount_zscore,
+    time_score,
+    geo_score,
+    new_entity_score,
+    frequency_score,
+    channel_switch_score,
+    round_amount_score,
+    balance_drain_score,
+    velocity_1h,
+    velocity_24h,
+    pct_of_balance_spent,
+    hour_of_day,
+    is_weekend,
+]
+```
+
+**Logic:**
+```python
+from sklearn.ensemble import IsolationForest
+
+# Fit su training data (comportamento normale)
+clf = IsolationForest(contamination=0.05, random_state=42)
+clf.fit(train_features)
+
+# Predict su eval data
+# -1 = anomaly, 1 = normal
+predictions = clf.predict(eval_features)
+anomaly_scores = clf.decision_function(eval_features)  # più negativo = più anomalo
+
+# Normalizza a 0-1
+normalized = (anomaly_scores.max() - anomaly_scores) / (anomaly_scores.max() - anomaly_scores.min())
+```
+
+**Output:** `float` 0.0-1.0 per ogni tx
+
+### 5B.2 graph_analyzer()
+
+**Purpose:** Rilevare pattern di frode organizzata (money laundering, smurfing, conti mulo) invisibili a livello di singola transazione.
+
+**Graph structure:**
+- **Nodi:** Account (sender_id, recipient_id, IBAN)
+- **Archi:** Transazioni (amount, timestamp, type)
+- **Node features:** User profile stats, aggregated tx behavior
+- **Edge features:** Amount, frequency, time patterns
+
+**Patterns da rilevare:**
+1. **Smurfing:** Molte piccole tx sotto soglia reporting che sommano a importo grande
+2. **Layering:** Catena A→B→C→D dove fondi passano rapidamente attraverso intermediari
+3. **Conti mulo:** Account che riceve da molti e trasferisce a pochi (o viceversa)
+4. **Circular flows:** A→B→C→A con importi simili
+
+**Implementation:**
+```python
+import networkx as nx
+# Opzionale per produzione: torch_geometric per GNN
+
+def build_transaction_graph(transactions):
+    G = nx.DiGraph()
+    for tx in transactions:
+        G.add_edge(
+            tx.sender_id, 
+            tx.recipient_id,
+            amount=tx.amount,
+            timestamp=tx.timestamp,
+            tx_id=tx.id
+        )
+    return G
+
+def detect_mule_accounts(G):
+    """Account con alto in-degree e alto out-degree = potenziale mulo"""
+    suspicious = []
+    for node in G.nodes():
+        in_deg = G.in_degree(node)
+        out_deg = G.out_degree(node)
+        if in_deg > 5 and out_deg > 3:
+            suspicious.append(node)
+    return suspicious
+
+def detect_circular_flows(G):
+    """Trova cicli nel grafo delle transazioni"""
+    cycles = list(nx.simple_cycles(G))
+    return [c for c in cycles if len(c) >= 3]
+
+def detect_rapid_layering(G, max_hours=2):
+    """Catene di tx rapide attraverso intermediari"""
+    # Implementazione basata su timestamp degli archi
+    pass
+```
+
+**Output:** 
+- Lista di `account_id` sospetti (muli, intermediari)
+- Lista di `transaction_id` coinvolti in pattern sospetti
+- Score 0.0-1.0 per ogni tx basato su coinvolgimento in pattern
+
+**Nota:** Per dataset grandi in produzione, considerare PyTorch Geometric con modelli GCN/GAT pre-trainati.
+
+---
+
+### 5C. Score Aggregation
+
+Tutti gli scorer + ML layer vengono applicati a ogni transazione eval:
 
 ```python
-def aggregate_scores(tx, profiles, locations):
+def aggregate_scores(tx, profiles, locations, ml_scores, graph_scores):
     scores = {
         "transaction_id": tx.id,
+        # Rule-based scorers
         "amount_score": amount_scorer(tx, profiles),
         "time_score": time_scorer(tx, profiles),
         "geo_score": geo_checker(tx, locations, profiles),
         "new_entity_score": new_entity_detector(tx, profiles),
         "frequency_score": frequency_checker(tx, profiles),
+        "channel_switch_score": channel_switch_scorer(tx, profiles),
+        "round_amount_score": round_amount_scorer(tx, profiles),
+        "balance_drain_score": balance_drain_scorer(tx, profiles),
+        # ML scores
+        "isolation_forest_score": ml_scores.get(tx.id, 0.0),
+        "graph_score": graph_scores.get(tx.id, 0.0),
     }
-    # Weighted average - pesi iniziali uniformi, tunable dopo test
+    
+    # Weighted average - pesi tunable
     weights = {
-        "amount_score": 0.25,
-        "time_score": 0.15,
-        "geo_score": 0.25,
-        "new_entity_score": 0.20,
-        "frequency_score": 0.15
+        "amount_score": 0.15,
+        "time_score": 0.08,
+        "geo_score": 0.15,
+        "new_entity_score": 0.12,
+        "frequency_score": 0.08,
+        "channel_switch_score": 0.07,
+        "round_amount_score": 0.05,
+        "balance_drain_score": 0.10,
+        "isolation_forest_score": 0.10,
+        "graph_score": 0.10,
     }
     scores["total_risk"] = sum(
         scores[k] * weights[k] for k in weights
@@ -240,8 +487,8 @@ def aggregate_scores(tx, profiles, locations):
 ```
 
 **Output DataFrame:**
-| tx_id | amount | time | geo | new_entity | freq | total_risk |
-|-------|--------|------|-----|------------|------|------------|
+| tx_id | amount | time | geo | new_entity | freq | channel | round | drain | iforest | graph | total_risk |
+|-------|--------|------|-----|------------|------|---------|-------|-------|---------|-------|------------|
 
 ---
 
@@ -276,6 +523,7 @@ def aggregate_scores(tx, profiles, locations):
 - Richieste credenziali/PIN
 - Link sospetti
 - Impersonificazione banca/servizi
+- **Correlazione temporale:** comunicazione sospetta ricevuta <24h prima di tx anomala
 
 **Output format:**
 ```json
@@ -286,6 +534,7 @@ def aggregate_scores(tx, profiles, locations):
       "user_name": "Alain Regnier",
       "source": "sms|email|audio",
       "severity": "high|medium|low",
+      "timestamp": "2087-03-15T14:30:00",
       "reason": "descrizione del segnale"
     }
   ]
@@ -293,6 +542,11 @@ def aggregate_scores(tx, profiles, locations):
 ```
 
 **Nota:** Il prompt include la mappatura nome→IBAN estratta da `users.json` per permettere il join con i profili.
+
+**Correlazione temporale:** Il `fraud_coordinator` riceverà i timestamp dei segnali per correlarli con le tx:
+- Segnale <2h prima di tx anomala → boost significativo al risk
+- Segnale <24h prima → boost moderato
+- Segnale >24h prima → considerato ma peso minore
 
 **Prompt template:**
 ```
@@ -458,6 +712,9 @@ ulid-py
 pandas
 geopy
 openai
+scikit-learn        # Isolation Forest
+networkx            # Graph analysis base
+# torch-geometric   # Optional: GNN per produzione su larga scala
 ```
 
 ---
