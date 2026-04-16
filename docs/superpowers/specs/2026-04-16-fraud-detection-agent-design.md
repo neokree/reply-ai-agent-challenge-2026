@@ -573,20 +573,6 @@ def aggregate_scores(tx, profiles, locations, ml_scores, graph_scores):
 
 ---
 
-### 5.8 Error Handling
-
-**Empty training data per user:**
-- Se un utente non ha tx nel training, usa fallback globali:
-  - `avg_amount_by_type`: media globale di tutte le tx training
-  - `std_amount_by_type`: deviazione standard globale
-  - `typical_hours`: [8-20] (orario lavorativo default)
-
-**Missing location data:**
-- Se `tx.location` è vuoto (non in-person): `geo_score = 0.0`
-- Se `locations.json` non ha dati per l'utente: `geo_score = 0.0`
-
----
-
 ## 6. AI Agents
 
 ### 6.1 comms_agent()
