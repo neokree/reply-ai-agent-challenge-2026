@@ -1,5 +1,12 @@
-langchain==1.2.15
-langchain-openai==1.1.13
+langchain>=1.2.0
+langchain-openai>=1.1.0
 langfuse>=3,<4
-python-dotenv==1.2.2
-ulid-py==1.1.0
+python-dotenv
+ulid-py
+pandas
+geopy
+openai
+scikit-learn
+networkx
+tenacity
+pytest
