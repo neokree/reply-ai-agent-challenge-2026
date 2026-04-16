@@ -718,36 +718,57 @@ Nessun altro testo, nessuna spiegazione.
 
 ### 6.3 LLM Output Parsing & Error Handling
 
+**Qwen thinking tag handling:**
+
+Qwen models with thinking enabled wrap their reasoning in `<think>...</think>` tags before the actual response. We must strip this before parsing.
+
+```python
+import re
+
+def strip_thinking_tags(response: str) -> str:
+    """
+    Remove <think>...</think> blocks from Qwen responses.
+    The actual answer comes AFTER the closing </think> tag.
+    """
+    # Pattern matches <think> followed by any content until </think>
+    pattern = r'<think>.*?</think>\s*'
+    cleaned = re.sub(pattern, '', response, flags=re.DOTALL)
+    return cleaned.strip()
+```
+
 **comms_agent output parsing:**
 ```python
 def parse_comms_response(response: str) -> dict:
+    # First strip thinking tags
+    cleaned = strip_thinking_tags(response)
+    
     try:
-        return json.loads(response)
+        return json.loads(cleaned)
     except json.JSONDecodeError:
-        # Fallback: cerca JSON dentro il testo
-        match = re.search(r'\{.*\}', response, re.DOTALL)
+        # Fallback: search for JSON inside the text
+        match = re.search(r'\{.*\}', cleaned, re.DOTALL)
         if match:
             return json.loads(match.group())
-        # Ultimo fallback: nessun segnale
+        # Last fallback: no signals found
         return {"signals": []}
-```
 
 **fraud_coordinator output parsing:**
 ```python
 def parse_coordinator_response(response: str, valid_tx_ids: set) -> list[str]:
-    lines = response.strip().split('\n')
+    # First strip thinking tags
+    cleaned = strip_thinking_tags(response)
+    
+    lines = cleaned.strip().split('\n')
     flagged = []
     for line in lines:
         tx_id = line.strip()
         if tx_id in valid_tx_ids:
             flagged.append(tx_id)
     
-    # Validazione output
+    # Output validation
     if len(flagged) == 0:
-        # Fallback: flag top 10% per risk score
         raise ValueError("Coordinator returned empty list")
     if len(flagged) == len(valid_tx_ids):
-        # Fallback: flag solo top 50% per risk score
         raise ValueError("Coordinator flagged all transactions")
     
     return flagged
