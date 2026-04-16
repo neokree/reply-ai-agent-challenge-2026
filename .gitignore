@@ -4,3 +4,9 @@
 
 # LangGraph
 .langgraph_api/
+
+# Python virtual environment
+.venv/
+
+# Environment variables
+.env
