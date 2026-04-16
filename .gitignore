@@ -11,4 +11,8 @@
 # Environment variables
 .env
 
-.DS_Storeoutput/
+.DS_Store
+output/
+__pycache__/
+*.pyc
+.pytest_cache/
