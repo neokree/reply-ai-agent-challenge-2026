@@ -17,11 +17,14 @@ You receive:
 3. The transactions to evaluate
 
 RULES:
-- You MUST flag at least 1 transaction
-- You CANNOT flag all transactions
-- Prioritize precision: it's better to miss some fraud than to block legitimate customers
+- You MUST flag at least 1 transaction and CANNOT flag all transactions
+- Missing fraud causes severe financial damage — catching fraud is the primary goal
+- Expect roughly 10-20% of transactions to be fraudulent (8-16 out of 80)
+- Flag ANY transaction with total_risk >= 0.15 unless there is strong evidence it is legitimate
+- Flag ALL transactions linked to users who appear in the communication signals with high or medium severity
 - Correlate signals: high algorithmic score + communication signal = almost certainly fraud
-- Consider temporal correlation: suspicious communication within 24h of anomalous transaction is very suspicious
+- Temporal correlation: suspicious communication within 24h of an anomalous transaction = flag it
+- When in doubt, flag — a false positive is far less damaging than missing real fraud
 
 Respond ONLY with the list of transaction_id to flag as fraudulent, one per line.
 No other text, no explanations."""
@@ -125,8 +128,8 @@ class FraudCoordinator:
         """Fallback to algorithmic decision based on risk scores."""
         sorted_df = risk_table.sort_values("total_risk", ascending=False)
 
-        # Flag top 15%, minimum 1, maximum 30%
-        n_to_flag = max(1, min(int(total_count * 0.15), int(total_count * 0.3)))
+        # Flag top 20%, minimum 1, maximum 35%
+        n_to_flag = max(1, min(int(total_count * 0.20), int(total_count * 0.35)))
 
         flagged = sorted_df.head(n_to_flag)["transaction_id"].tolist()
 

@@ -28,7 +28,7 @@ def geocode_location(location_str: str) -> Optional[tuple[float, float]]:
     Geocode a location string to (lat, lng).
     Uses known cities first, then falls back to Nominatim.
     """
-    if not location_str:
+    if not location_str or not isinstance(location_str, str):
         return None
 
     # Check cache
@@ -73,7 +73,10 @@ def geo_scorer(
     Returns:
         Risk score 0.0-1.0
     """
-    if not tx_location:
+    # Skip geocoding to avoid rate limits - return 0 for all
+    return 0.0
+
+    if not tx_location or not isinstance(tx_location, str):
         return 0.0
 
     tx_coords = geocode_location(tx_location)

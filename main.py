@@ -42,7 +42,7 @@ def create_model():
     return ChatOpenAI(
         api_key=os.getenv("OPENROUTER_API_KEY"),
         base_url="https://openrouter.ai/api/v1",
-        model="qwen/qwen3-plus",
+        model="qwen/qwen3.6-plus",
         temperature=0.3,
         max_tokens=4000,
     )
